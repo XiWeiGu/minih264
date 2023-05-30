@@ -723,6 +723,7 @@ typedef struct H264E_persist_tag
         //    uint16_t qfull[8];
         //    uint16_t dqfull[8];
         //} qdat[2];
+        // qdat[0] - luma, qdat[1] - chroma, including quant/dequant parameters
         uint16_t qdat[2][6 + 2 + 2 + 8 + 8 + 8 + 8];
     } rc;
 
@@ -9615,6 +9616,7 @@ static void intra_choose_4x4(h264e_enc_t *enc)
             memset((qv->qy+n), 0, sizeof(qv->qy[0]));
         }
 
+        // Accumulate cost of 4x4 blocks
         cost += sad;
 
         edge[2] = block[3];
@@ -9624,6 +9626,7 @@ static void intra_choose_4x4(h264e_enc_t *enc)
     }
     enc->scratch->nz_mask = (uint16_t)nz_mask;
 
+    // If 4x4 is better than 16x16, restore 16x16 reference
     if (cost < enc->mb.cost)
     {
         enc->mb.cost = cost;
@@ -9683,6 +9686,7 @@ static void intra_choose_16x16(h264e_enc_t *enc, pix_t *left, pix_t *top, int av
     h264e_intra_predict_16x16(enc->ptest, left, top, enc->mb.i16.pred_mode_luma);
 
     // coding cost
+    // Calculate Rate-Distortion for each 16x16 block
     sad = h264e_sad_mb_unlaign_8x8(enc->scratch->mb_pix_inp, 16, enc->ptest, sad4)        // SAD
         + MUL_LAMBDA(bitsize_ue(enc->mb.i16.pred_mode_luma + 1), g_lambda_q4[enc->rc.qp]) // side-info penalty
         + g_lambda_i16_q4[enc->rc.qp];                                                    // block kind penalty
@@ -9691,6 +9695,10 @@ static void intra_choose_16x16(h264e_enc_t *enc, pix_t *left, pix_t *top, int av
     {
         enc->mb.cost = sad;
         enc->mb.type = 6;
+        /**
+         * @brief Store the best 16x16 intra mode
+         *
+         */
         SWAP(pix_t*, enc->pbest, enc->ptest);
     }
 }
@@ -10566,6 +10574,9 @@ static void mb_encode(h264e_enc_t *enc, int enc_type)
 
     if (enc->mb.type >= 0)
     {
+        /**
+         * luma intra prediction
+         */
         intra_choose_16x16(enc, left, top, avail);
         if (enc->run_param.encode_speed < 2 || enc->slice.type != SLICE_TYPE_P) // enable intra4x4 on P slices
         {
@@ -10666,6 +10677,7 @@ static void rc_set_qp(h264e_enc_t *enc, int qp)
         {
             uint16_t *qdat0 = enc->rc.qdat[2 - cloop];
             uint16_t *qdat  = enc->rc.qdat[2 - cloop];
+            // qbits
             int qp_div6 = qp*86 >> 9;
             int qp_mod6 = qp - qp_div6*6;
             const int16_t *quant_coeff = g_quant_coeff + qp_mod6*6; // TODO: need calculate qp%6*6
@@ -10674,7 +10686,9 @@ static void rc_set_qp(h264e_enc_t *enc, int qp)
             // Quant/dequant multiplier
             do
             {
+                // Quant MF >> qbits
                 *qdat++ = *quant_coeff++ << 1 >> qp_div6;
+                // Dequant MF << qbits?
                 *qdat++ = *quant_coeff++ << qp_div6;
             } while(--i);
 
@@ -10706,6 +10720,7 @@ static void rc_set_qp(h264e_enc_t *enc, int qp)
             qdat[4] = qdat[6] = qdat0[3];
             qdat[5] = qdat[7] = qdat0[5];
 
+            // Copy to luma QP to chroma QP according to LUT.
             qp = qpy2qpc[qp + DQP_CHROMA];
         } while (--cloop);
     }
@@ -10783,6 +10798,7 @@ static int rc_frame_start(h264e_enc_t *enc, int is_intra, int is_refers_to_long_
             add_bits += (enc->rc.vbv_target_level - enc->rc.vbv_bits) >> 4;
         }
     }
+    // Default enc->rc.vbv_target_level is 12500
     if (enc->param.vbv_size_bytes)
     {
         add_bits = MIN(add_bits, (enc->param.vbv_size_bytes*8*7 >> 3) - enc->rc.vbv_bits);
@@ -10799,6 +10815,9 @@ static int rc_frame_start(h264e_enc_t *enc, int is_intra, int is_refers_to_long_
 #endif
     {
         // Increase VBV target level due to to I-frame load: this avoids QP adaptation after I-frame
+        // Restore VBV target level after I-frame
+        // bit_budget - enc->run_param.desired_frame_bytes*8 is number of bits to be added to VBV buffer
+        // enc->rc.vbv_bits is number of bits in VBV buffer
         enc->rc.vbv_target_level = enc->rc.vbv_bits + bit_budget - enc->run_param.desired_frame_bytes*8;
     }
 
@@ -11280,8 +11299,11 @@ static int H264E_encode_one(H264E_persist_t *enc, const H264E_run_param_t *opt,
 {
     int i, k;
     // slice reset
+    // added by gxw, 2023-05-23
+    // long_term_idx_use = -1; is_refers_to_long_term = 0; long_term_idx_update = 0;
     enc->slice.type = (long_term_idx_use < 0 ? SLICE_TYPE_I : SLICE_TYPE_P);
-    rc_frame_start(enc, (long_term_idx_use < 0) ? 1 : 0, is_refers_to_long_term);
+    // rc: Rate-control
+    rc_frame_start(enc, (long_term_idx_use < 0) ? 1 : 0 /* is_intra */, is_refers_to_long_term);
 
     enc->mb.x = enc->mb.y = enc->mb.num = 0;
 
@@ -11373,6 +11395,8 @@ static int H264E_encode_one(H264E_persist_t *enc, const H264E_run_param_t *opt,
         } else
 #endif
         {
+            // If undef H264E_SVC_API, enc_type is always 0
+            // pps_id = enc->param.sps_id*4
             encode_slice(enc, frame_type, long_term_idx_use, long_term_idx_update, pps_id, enc_type);
         }
     }
