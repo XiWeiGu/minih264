@@ -737,12 +737,12 @@ typedef struct H264E_persist_tag
     // predictors contexts
     point_t *mv_pred;               // MV for left&top 4x4 blocks
     uint8_t *nnz;                   // Number of non-zero coeffs per 4x4 block for left&top
-    int32_t *i4x4mode;              // Intra 4x4 mode for left&top
-    pix_t *top_line;                // left&top neighbor pixels
+    int32_t *i4x4mode;              // Intra 4x4 mode for left&top, the size is enc->mb.nbx*4 + 4
+    pix_t *top_line;                // left&top neighbor pixels, the size is enc->mb.nbx*32 + 32 + 16
 
     // output data
     uint8_t *out;                   // Output data storage (pointer to scratch RAM!)
-    unsigned int out_pos;           // Output byte position
+    unsigned int out_pos;           // Output byte position, reset to 0 after each frame
     bs_t bs[1];                     // Output bitbuffer
 
     scratch_t *scratch;             // Pointer to scratch RAM
@@ -1089,6 +1089,7 @@ ADJUSTABLE uint16_t g_deadzonei[] = {
     17491, 17491,
 };
 
+// luma 4x4 Macroblock initial cost according to QP
 ADJUSTABLE uint16_t g_lambda_i4_q4[] = {
     27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
     27, 31, 34, 38, 41,
@@ -6934,6 +6935,8 @@ static void FwdTransformResidual4x42(const uint8_t *inp, const uint8_t *pred,
     int i;
     int16_t tmp[16];
 
+// For plain c, TRANSPOSE_BLOCK is always 1
+// !!! The rersult has been transposed !!!
 #if TRANSPOSE_BLOCK
     // Transform columns
     for (i = 0; i < 4; i++, pred++, inp++)
@@ -7081,6 +7084,7 @@ static int zero_smallq(quant_t *q, int mode, const uint16_t *qdat)
 
 static int quantize(quant_t *q, int mode, const uint16_t *qdat, int zmask)
 {
+    // For plain c, UNZIGSAG_IN_QUANT is always 0, TRANSPOSE_BLOCK is always 1
 #if UNZIGSAG_IN_QUANT
 #if TRANSPOSE_BLOCK
     // ; Zig-zag scan      Transposed zig-zag
@@ -7111,7 +7115,11 @@ static int quantize(quant_t *q, int mode, const uint16_t *qdat, int zmask)
             } else
             {
                 for (i = i0; i < 16; i++)
-                {
+                {   /*  0, 2, 0, 2,
+                        2, 4, 2, 4,
+                        0, 2, 0, 2,
+                        2, 4, 2, 4
+                    */
                     int off = g_idx2quant[i];
                     int v, round = qdat[OFFS_RND_INTER];
 
@@ -7162,6 +7170,8 @@ static void transform(const pix_t *inp, const pix_t *pred, int inp_stride, int m
     } while (--crow);
 }
 
+// inp_stride = 16
+// mode = QDQ_MODE_INTRA_4 = 2
 static int h264e_transform_sub_quant_dequant(const pix_t *inp, const pix_t *pred, int inp_stride, int mode, quant_t *q, const uint16_t *qdat)
 {
     int zmask;
@@ -7177,10 +7187,12 @@ static int h264e_transform_sub_quant_dequant(const pix_t *inp, const pix_t *pred
             pq++;
         } while (--cloop);
     }
+    // if mode = QDQ_MODE_INTRA_4, return 0 (no zero blocks)
     zmask = zero_smallq(q, mode, qdat);
     return quantize(q, mode, qdat, zmask);
 }
 
+// For intra4x4 side = 1, mask = -1
 static void h264e_transform_add(pix_t *out, int out_stride, const pix_t *pred, quant_t *q, int side, int32_t mask)
 {
     int crow = side;
@@ -8395,6 +8407,7 @@ static void pix_copy_recon_pic_to_ref(h264e_enc_t *enc)
 static int mb_avail_flag(const h264e_enc_t *enc)
 {
     int nmb = enc->mb.num;
+    // flag = 1 if AVAIL_T avail
     int flag = nmb >= enc->slice.start_mb_num + enc->frame.nmbx;
     if (nmb >= enc->slice.start_mb_num + enc->frame.nmbx - 1 && enc->mb.x != enc->frame.nmbx-1)
     {
@@ -9524,8 +9537,10 @@ static void intra_choose_4x4(h264e_enc_t *enc)
     scratch_t *qv = enc->scratch;
     pix_t *mb_dec = enc->dec.yuv[0];
     pix_t *dec = enc->ptest;
+    // Init cost according to qp
     int cost =  g_lambda_i4_q4[enc->rc.qp];// + MUL_LAMBDA(16, g_lambda_q4[enc->rc.qp]);    // 4x4 cost: at least 16 bits + penalty
 
+    // 48 bytes of edge data
     uint32_t edge_store[(3 + 16 + 1 + 16 + 4)/4 + 2]; // pad for SSE
     pix_t *edge = ((pix_t*)edge_store) + 3 + 16 + 1;
     uint32_t *edge32 = (uint32_t *)edge;              // alias
@@ -9557,6 +9572,7 @@ static void intra_choose_4x4(h264e_enc_t *enc)
         int8_t *ctx_t = (int8_t *)enc->i4x4mode + 4 + enc->mb.x*4 + c;
         edge = ((pix_t*)edge_store) + 3 + 16 + 1 + 4*c - 4*r;
 
+        // TODO: Maybe We should supply mb4x4_avail_flag()?
         a = avail;
         a &= block2avail[n];
         a |= block2avail[n] >> 4;
@@ -9583,6 +9599,7 @@ static void intra_choose_4x4(h264e_enc_t *enc)
             mpred = 2;
         }
 
+        // Using Rate-Distortion optimization choose best mode
         sad = h264e_intra_choose_4x4(blockin, block, a, edge, mpred, MUL_LAMBDA(3, g_lambda_q4[enc->rc.qp]));
         mode = sad & 15;
         sad >>= 4;
@@ -9602,10 +9619,13 @@ static void intra_choose_4x4(h264e_enc_t *enc)
         {
             //  skip transform on low SAD gains just about 2% for all-intra coding at QP40,
             //  for other QP gain is minimal, so SAD check do not used
+            //  transform quant and dequant
             nz_mask |= h264e_transform_sub_quant_dequant(blockin, block, 16, QDQ_MODE_INTRA_4, qv->qy + n, enc->rc.qdat[0]);
 
             if (nz_mask & 1)
             {
+                // Update qy->dq and block, why ?
+                // block store pred value, qy->dq store dequant value
                 h264e_transform_add(block, 16, block, qv->qy + n, 1, ~0);
             }
         } else
@@ -9616,6 +9636,7 @@ static void intra_choose_4x4(h264e_enc_t *enc)
         // Accumulate cost of 4x4 blocks
         cost += sad;
 
+        // Update edge data
         edge[2] = block[3];
         edge[1] = block[3 + 16];
         edge[0] = block[3 + 16*2];
@@ -10528,6 +10549,7 @@ static void mb_deblock(deblock_filter_t *df, int mb_type, int qp_this, int mbx, 
 */
 static void mb_encode(h264e_enc_t *enc, int enc_type)
 {
+
     pix_t *top = enc->top_line + 48 + enc->mb.x*32;
     pix_t *left = enc->top_line;
     int avail = enc->mb.avail = mb_avail_flag(enc);
@@ -10540,14 +10562,16 @@ static void mb_encode(h264e_enc_t *enc, int enc_type)
              MIN(16, enc->param.height - enc->mb.y*16));
     } else
     {
-        // cache input macroblock
+        // cache input luma macroblock
         h264e_copy_16x16(enc->scratch->mb_pix_inp, 16, mb_input_luma(enc), enc->inp.stride[0]);
     }
 
     if (!(avail & AVAIL_L)) left = NULL;
     if (!(avail & AVAIL_T)) top  = NULL;
 
+    // Store 16x16 Macroblock best prediction
     enc->pbest = enc->scratch->mb_pix_store;
+    // Store 16x16 Macroblock tmp prediction
     enc->ptest = enc->pbest + 256;
     enc->mb.type = 0;
     enc->mb.cost = 0x7FFFFFFF;
@@ -10581,6 +10605,8 @@ static void mb_encode(h264e_enc_t *enc, int enc_type)
         }
     }
 
+    // if enc->mb.type == 0, then we have intra 16x16 prediction
+    // if enc->mb.type == 5, then we have intra 4x4 prediction
     if (enc->mb.type < 5)
     {
         mv_clusters_update(enc, enc->mb.mv[0]);
