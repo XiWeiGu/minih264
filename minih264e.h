@@ -736,7 +736,7 @@ typedef struct H264E_persist_tag
 
     // predictors contexts
     point_t *mv_pred;               // MV for left&top 4x4 blocks
-    uint8_t *nnz;                   // Number of non-zero coeffs per 4x4 block for left&top
+    uint8_t *nnz;                   // Number of non-zero coeffs per 4x4 block for left&top, the size is enc->mb.nbx*8 + 8
     int32_t *i4x4mode;              // Intra 4x4 mode for left&top, the size is enc->mb.nbx*4 + 4
     pix_t *top_line;                // left&top neighbor pixels, the size is enc->mb.nbx*32 + 32 + 16
 
@@ -6901,8 +6901,9 @@ static void h264e_quant_luma_dc(quant_t *q, int16_t *deq, const uint16_t *qdat)
 
 static int h264e_quant_chroma_dc(quant_t *q, int16_t *deq, const uint16_t *qdat)
 {
-    int16_t *tmp = ((int16_t*)q) - 16;
+    int16_t *tmp = ((int16_t*)q) - 16; // dcu/dcv
     hadamar2_2d(tmp);
+    // deq: quant_dc_u/quant_dc_v
     quant_dc(tmp, deq, (int16_t)(qdat[0] << 1), 4, 0xAAAA);
     hadamar2_2d(tmp);
     assert(!(qdat[1] & 1));
@@ -7061,12 +7062,13 @@ static int is_zero4(const quant_t *q, int i0, const uint16_t *thr)
 static int zero_smallq(quant_t *q, int mode, const uint16_t *qdat)
 {
     int zmask = 0;
+    // If mode = QDQ_MODE_CHROMA, then i0=1, n=2
     int i, i0 = mode & 1, n = mode >> 1;
     if (mode == QDQ_MODE_INTER || mode == QDQ_MODE_CHROMA)
     {
         for (i = 0; i < n*n; i++)
         {
-            if (is_zero(q[i].dq, i0, qdat + OFFS_THR_1_OFF))
+            if (is_zero(q[i].dq, i0, qdat + OFFS_THR_1_OFF /* 10 */))
             {
                 zmask |= (1 << i); //9.19
             }
@@ -7114,6 +7116,8 @@ static int quantize(quant_t *q, int mode, const uint16_t *qdat, int zmask)
                 *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;
             } else
             {
+                // For chroma mb, i = i0 = 1 means do not perform
+                // quantization on DC
                 for (i = i0; i < 16; i++)
                 {   /*  0, 2, 0, 2,
                         2, 4, 2, 4,
@@ -7121,7 +7125,7 @@ static int quantize(quant_t *q, int mode, const uint16_t *qdat, int zmask)
                         2, 4, 2, 4
                     */
                     int off = g_idx2quant[i];
-                    int v, round = qdat[OFFS_RND_INTER];
+                    int v, round = qdat[OFFS_RND_INTER /* 6 */];
 
                     if (q->dq[i] < 0) round = 0xFFFF - round;
 
@@ -7170,16 +7174,21 @@ static void transform(const pix_t *inp, const pix_t *pred, int inp_stride, int m
     } while (--crow);
 }
 
+// luma :
 // inp_stride = 16
 // mode = QDQ_MODE_INTRA_4 = 2
+// chroma:
+// mode = QDQ_MODE_CHROMA = 5
 static int h264e_transform_sub_quant_dequant(const pix_t *inp, const pix_t *pred, int inp_stride, int mode, quant_t *q, const uint16_t *qdat)
 {
     int zmask;
     transform(inp, pred, inp_stride, mode, q);
     if (mode & 1) // QDQ_MODE_INTRA_16 || QDQ_MODE_CHROMA
     {
+        // For CHROMA, we need get DC of U/V,
+        // store in dcu and dcv
         int cloop = (mode >> 1)*(mode >> 1);
-        short *dc = ((short *)q) - 16;
+        short *dc = ((short *)q) - 16; // Get address of dcu/dcv
         quant_t *pq = q;
         do
         {
@@ -7192,7 +7201,8 @@ static int h264e_transform_sub_quant_dequant(const pix_t *inp, const pix_t *pred
     return quantize(q, mode, qdat, zmask);
 }
 
-// For intra4x4 side = 1, mask = -1
+// For chroma intra4x4 side = 1, mask = -1
+// For luma, side = 2, mask = 0xf0 00 00 00
 static void h264e_transform_add(pix_t *out, int out_stride, const pix_t *pred, quant_t *q, int side, int32_t mask)
 {
     int crow = side;
@@ -7217,6 +7227,7 @@ static void h264e_transform_add(pix_t *out, int out_stride, const pix_t *pred, q
             } else
             {
                 int i, j;
+                // Inverse Transform？
                 TransformResidual4x4(q->dq);
                 for (j = 0; j < 4; j++)
                 {
@@ -9185,6 +9196,8 @@ static void encode_slice_header(h264e_enc_t *enc, int frame_type, int long_term_
 
 /**
 *   Macroblock transform, quantization and bitstream encoding
+*   If luma mb is intra4x4, then only chroma mb
+*   For intra4x4, enc_type = base_mode = 0
 */
 static void mb_write(h264e_enc_t *enc, int enc_type, int base_mode)
 {
@@ -9271,13 +9284,16 @@ l_skip:
                 inp_stride = 8;
             }
 
+            // nz_mask: x x x x, 4 bits
             nz_mask = h264e_transform_sub_quant_dequant(pix_mb_uv, pred, inp_stride, QDQ_MODE_CHROMA, pquv, enc->rc.qdat[1]);
 
             if (nz_mask)
             {
                 cbpc = 2;
             }
-
+            // Process the chroma block DC coefficients separately.
+            // Store dc quant coefficients in quant_dc_u/quant_dc_v
+            // Store dc dequant coefficients in qu->dq/qv->dq
             cbpc |= dc_flag = h264e_quant_chroma_dc(pquv, uv == 1 ? qv->quant_dc_u : qv->quant_dc_v, enc->rc.qdat[1]);
 
             if (!(dc_flag | nz_mask))
@@ -9289,6 +9305,7 @@ l_skip:
                 {
                     for (i = 0; i < 4; i++)
                     {
+                        // If ac quant coefficients is zero, memset ac dequant coefficients as zero directly
                         if (~nz_mask & (8 >> i))
                         {
                             memset(pquv[i].dq + 1, 0, (16 - 1)*sizeof(int16_t));
@@ -9296,6 +9313,7 @@ l_skip:
                     }
                     nz_mask = 15;
                 }
+                // Reconstructed luma mb in enc->dec.yuv[uv], ac Inverse Transform in qu->dq/qv->dq?
                 h264e_transform_add(enc->dec.yuv[uv], enc->dec.stride[uv], pred, pquv, 2, nz_mask << 28);
             }
         }
@@ -9437,6 +9455,11 @@ l_skip:
         {
             for (i = 0; i < 16; i++)
             {
+                /* 0 1 4 5
+                 * 2 3 6 7
+                 * 8 9 C D
+                 * A B E F
+                 */
                 int j = decode_block_scan[i];
                 if (cbp & (1 << (i >> 2)))
                 {
@@ -9535,6 +9558,7 @@ static void intra_choose_4x4(h264e_enc_t *enc)
 {
     int i, n, a, nz_mask = 0, avail = mb_avail_flag(enc);
     scratch_t *qv = enc->scratch;
+    // Reconstruction current MB
     pix_t *mb_dec = enc->dec.yuv[0];
     pix_t *dec = enc->ptest;
     // Init cost according to qp
@@ -9590,6 +9614,7 @@ static void intra_choose_4x4(h264e_enc_t *enc)
             a |= AVAIL_TR;
         }
 
+        // Input MB, size 16x16
         blockin = enc->scratch->mb_pix_inp + (c + r*16)*4;
         block = dec + (c + r*16)*4;
 
@@ -9624,7 +9649,7 @@ static void intra_choose_4x4(h264e_enc_t *enc)
 
             if (nz_mask & 1)
             {
-                // Update qy->dq and block, why ?
+                // Update qy->dq and block, block is the reconstructed block
                 // block store pred value, qy->dq store dequant value
                 h264e_transform_add(block, 16, block, qv->qy + n, 1, ~0);
             }
@@ -10570,6 +10595,7 @@ static void mb_encode(h264e_enc_t *enc, int enc_type)
     if (!(avail & AVAIL_T)) top  = NULL;
 
     // Store 16x16 Macroblock best prediction
+    // Size of mb_pix_store is 16x16x4
     enc->pbest = enc->scratch->mb_pix_store;
     // Store 16x16 Macroblock tmp prediction
     enc->ptest = enc->pbest + 256;
