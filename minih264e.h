@@ -6230,6 +6230,7 @@ static void h264e_intra_predict_16x16(pix_t *predict,  const pix_t *left, const 
             t3 = ((uint32_t*)top)[3];
         } else //(mode == 2)
         {
+            // 直流系数是top和left的平均值（只有一个数据）
             t0 = t1 = t2 = t3 = intra_predict_dc(left, top, 4);
         }
         do
@@ -8199,6 +8200,7 @@ static unsigned __clz(unsigned v)
 
 /**
 *   Size of unsigned Golomb code
+*   ue: 使用于宏块类型和参考帧index等
 */
 static int bitsize_ue(int v)
 {
@@ -8434,6 +8436,43 @@ static int mb_avail_flag(const h264e_enc_t *enc)
     }
     return flag;
 }
+
+/**
+*   @param n: Current 4x4 num in 16x16
+*   @return neighbors availability flags for current 4x4 macroblock
+*/
+static int mb4x4_avail_flag(const h264e_enc_t *enc, int n) {
+    /**
+     *  The lower 4 bits of the flag indicate which neighboring properties
+     *  the current 4x4 macroblock can inherit from the parent 16x16 macroblock.
+     *  block2avail[0] is 0x07, The flag indicates that if the parent 16x16 has L, T, and TL adjacent data,
+     *  then the 0th 4x4 macroblock must also have them.
+     *  The upper 4 bits of the flag indicate the current attributes of the 4x4 macroblock itself
+     *  (confined within the 16x16 macroblock). The 0th macroblock definitely does not have neighboring
+     *  data from the top (T), left (L), top-left (TL), and top-right (TR)
+    */
+    static const uint8_t block2avail[16] = {
+        0x07, 0x23, 0x23, 0x2b, 0x9b, 0x77, 0xff, 0x77, 0x9b, 0xff, 0xff, 0x77, 0x9b, 0x77, 0xff, 0x77,
+    };
+    int a, avail = mb_avail_flag(enc);
+    a = avail;
+    a &= block2avail[n];
+    a |= block2avail[n] >> 4;
+
+    if (!(block2avail[n] & AVAIL_TL)) // TL replace
+    {
+        if ((n <= 2 && (avail & AVAIL_T)) ||
+            (n  > 2 && (avail & AVAIL_L)))
+        {
+            a |= AVAIL_TL;
+        }
+    }
+    if (n < 2 && (avail & AVAIL_T))
+    {
+        a |= AVAIL_TR;
+    }
+}
+
 
 /**
 *   @return median of 3 given integers
@@ -9556,7 +9595,7 @@ l_skip:
 */
 static void intra_choose_4x4(h264e_enc_t *enc)
 {
-    int i, n, a, nz_mask = 0, avail = mb_avail_flag(enc);
+    int i, n, a, nz_mask = 0;
     scratch_t *qv = enc->scratch;
     // Reconstruction current MB
     pix_t *mb_dec = enc->dec.yuv[0];
@@ -9571,7 +9610,7 @@ static void intra_choose_4x4(h264e_enc_t *enc)
     const uint32_t *top32 = (const uint32_t*)(enc->top_line + 48 + enc->mb.x*32);
     pix_t *left = enc->top_line;
 
-    edge[-1] = enc->top_line[32];
+    edge[-1] = enc->top_line[32]; // Luma UL
     for (i = 0; i < 16; i++)
     {
         edge[-2 - i] = left[i];
@@ -9580,13 +9619,38 @@ static void intra_choose_4x4(h264e_enc_t *enc)
     {
         edge32[i] = top32[i];
     }
-    edge32[4] = top32[8];
+    edge32[4] = top32[8]; // 下一个宏块16x16的U0
 
     for (n = 0; n < 16; n++)
     {
+        //#define AVAIL_TR    8
+        //#define AVAIL_TL    4
+        //#define AVAIL_L     2
+        //#define AVAIL_T     1
+#if 0
         static const uint8_t block2avail[16] = {
             0x07, 0x23, 0x23, 0x2b, 0x9b, 0x77, 0xff, 0x77, 0x9b, 0xff, 0xff, 0x77, 0x9b, 0x77, 0xff, 0x77,
         };
+
+        // TODO: Maybe We should supply mb3x4_avail_flag()?
+        a = avail;
+        a &= block1avail[n];
+        a |= block1avail[n] >> 4;
+
+        if (!(block1avail[n] & AVAIL_TL)) // TL replace
+        {
+            if ((n <= 2 && (avail & AVAIL_T)) ||
+                (n  > 2 && (avail & AVAIL_L)))
+            {
+                a |= AVAIL_TL;
+            }
+        }
+        if (n < 2 && (avail & AVAIL_T))
+        {
+            a |= AVAIL_TR;
+        }
+#endif
+        a = mb4x4_avail_flag(enc, n);
         pix_t *block;
         pix_t *blockin;
         int sad, mpred, mode;
@@ -9596,35 +9660,18 @@ static void intra_choose_4x4(h264e_enc_t *enc)
         int8_t *ctx_t = (int8_t *)enc->i4x4mode + 4 + enc->mb.x*4 + c;
         edge = ((pix_t*)edge_store) + 3 + 16 + 1 + 4*c - 4*r;
 
-        // TODO: Maybe We should supply mb4x4_avail_flag()?
-        a = avail;
-        a &= block2avail[n];
-        a |= block2avail[n] >> 4;
-
-        if (!(block2avail[n] & AVAIL_TL)) // TL replace
-        {
-            if ((n <= 3 && (avail & AVAIL_T)) ||
-                (n  > 3 && (avail & AVAIL_L)))
-            {
-                a |= AVAIL_TL;
-            }
-        }
-        if (n < 3 && (avail & AVAIL_T))
-        {
-            a |= AVAIL_TR;
-        }
-
         // Input MB, size 16x16
         blockin = enc->scratch->mb_pix_inp + (c + r*16)*4;
         block = dec + (c + r*16)*4;
 
-        mpred = MIN(*ctx_l, *ctx_t);
+        mpred = MIN(*ctx_l, *ctx_t); // Default = -1, 预测模式中的较小者
         if (mpred < 0)
         {
             mpred = 2;
         }
 
         // Using Rate-Distortion optimization choose best mode
+        // Return sad = best_m + (best_sad << 4);
         sad = h264e_intra_choose_4x4(blockin, block, a, edge, mpred, MUL_LAMBDA(3, g_lambda_q4[enc->rc.qp]));
         mode = sad & 15;
         sad >>= 4;
@@ -9632,7 +9679,7 @@ static void intra_choose_4x4(h264e_enc_t *enc)
         *ctx_l = *ctx_t = (int8_t)mode;
         if (mode == mpred)
         {
-            mode = -1;
+            mode = -1; // 意味着当前4x4宏块的预测模式不需要编码。
         } else if (mode > mpred)
         {
             mode--;
@@ -9683,6 +9730,10 @@ static void intra_choose_4x4(h264e_enc_t *enc)
 */
 static int intra_estimate_16x16(pix_t *p, int s, int avail, int qp)
 {
+    //#define AVAIL_TR    8
+    //#define AVAIL_TL    4
+    //#define AVAIL_L     2
+    //#define AVAIL_T     1
     static const uint8_t mode_i16x16_valid[8] = { 4, 5, 6, 7, 4, 5, 6, 15 };
     pix_t p00 = p[0];
     pix_t p01 = p[15];
@@ -9690,9 +9741,12 @@ static int intra_estimate_16x16(pix_t *p, int s, int avail, int qp)
     pix_t p11 = p[15*s + 15];
     int v = mode_i16x16_valid[avail & (AVAIL_T + AVAIL_L + AVAIL_TL)];
     // better than above on low bitrates
+    // 水平差值
     int dx = ABS(p00 - p01) + ABS(p10 - p11) + ABS(p[8*s] - p[8*s + 15]);
+    // 垂直差值
     int dy = ABS(p00 - p10) + ABS(p01 - p11) + ABS(p[8] - p[15*s + 8]);
 
+    // 如果水平差值远大于垂直差值并且垂直差值足够小，采用编码模式0
     if ((dx > 30 + 3*dy && dy < (100 + 50 - qp)
         //|| (/*dx < 50 &&*/ dy <= 12)
         ) && (v & 1))
@@ -9700,6 +9754,7 @@ static int intra_estimate_16x16(pix_t *p, int s, int avail, int qp)
     else if (dy > 30 + 3*dx && dx < (100 + 50 - qp) && (v & (1 << 1)))
         return 1;
     else
+    // 对于模式2(DC)，不需要top和left像素
         return 2;
 }
 
@@ -9722,7 +9777,7 @@ static int intra_estimate_16x16(pix_t *p, int s, int avail, int qp)
 static void intra_choose_16x16(h264e_enc_t *enc, pix_t *left, pix_t *top, int avail)
 {
     int sad, sad4[4];
-    // heuristic mode decision
+    // heuristic(启发式) mode decision
     enc->mb.i16.pred_mode_luma = intra_estimate_16x16(enc->scratch->mb_pix_inp, 16, avail, enc->rc.qp);
 
     // run chosen predictor
@@ -9730,8 +9785,9 @@ static void intra_choose_16x16(h264e_enc_t *enc, pix_t *left, pix_t *top, int av
 
     // coding cost
     // Calculate Rate-Distortion for each 16x16 block
-    sad = h264e_sad_mb_unlaign_8x8(enc->scratch->mb_pix_inp, 16, enc->ptest, sad4)        // SAD
-        + MUL_LAMBDA(bitsize_ue(enc->mb.i16.pred_mode_luma + 1), g_lambda_q4[enc->rc.qp]) // side-info penalty
+    // g_lambda_q4 它在编码过程中用于平衡视频质量和比特率之间的权衡。使用量化系数作为索引
+    sad = h264e_sad_mb_unlaign_8x8(enc->scratch->mb_pix_inp, 16, enc->ptest, sad4)        // SAD(绝对误差和)
+        + MUL_LAMBDA(bitsize_ue(enc->mb.i16.pred_mode_luma + 1)/*预测模式ue编码长度*/, g_lambda_q4[enc->rc.qp]) // side-info penalty
         + g_lambda_i16_q4[enc->rc.qp];                                                    // block kind penalty
 
     if (sad < enc->mb.cost)
@@ -10594,7 +10650,7 @@ static void mb_encode(h264e_enc_t *enc, int enc_type)
     if (!(avail & AVAIL_L)) left = NULL;
     if (!(avail & AVAIL_T)) top  = NULL;
 
-    // Store 16x16 Macroblock best prediction
+    // Store 16x16 Macroblock best prediction (Global)
     // Size of mb_pix_store is 16x16x4
     enc->pbest = enc->scratch->mb_pix_store;
     // Store 16x16 Macroblock tmp prediction
@@ -10631,7 +10687,7 @@ static void mb_encode(h264e_enc_t *enc, int enc_type)
         }
     }
 
-    // if enc->mb.type == 0, then we have intra 16x16 prediction
+    // if enc->mb.type == 6, then we have intra 16x16 prediction
     // if enc->mb.type == 5, then we have intra 4x4 prediction
     if (enc->mb.type < 5)
     {
@@ -10667,6 +10723,7 @@ _WRITE_MB:
             }
         }
 #endif
+        // 去滤波技术：减少编码后视频中图像边界的锐利度，以减少由于压缩引起的视觉失真
         mb_deblock(&enc->df, enc->mb.type, enc->rc.prev_qp, mbx, mby, &enc->dec, base_mode);
     }
 }
