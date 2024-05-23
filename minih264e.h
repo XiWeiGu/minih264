@@ -713,8 +713,8 @@ typedef struct H264E_persist_tag
 #define OFFS_DEQUANT_VECT 34
         //struct
         //{
-        //    uint16_t qdq[6];
-        //    uint16_t rnd[2]; // inter/intra
+        //    uint16_t qdq[6]; // Interleaved Storage Quantization and Dequantization MF
+        //    uint16_t rnd[2]; // inter/intra, Offset f, improves the visual quality of the reconstructed image
         //    uint16_t thr[2]; // thresholds
         //    uint16_t zero_thr[2][8];
         //    uint16_t qfull[8];
@@ -6970,7 +6970,7 @@ static void FwdTransformResidual4x42(const uint8_t *inp, const uint8_t *pred,
         TRANSFORM(d0, d1, d2, d3, tmp + i, 1);
         pred += 16;
         inp += inp_stride;
-    }
+   }
 
     /* Transform columns */
     for (i = 0; i < 4; i++)
@@ -6992,6 +6992,7 @@ static void TransformResidual4x4(int16_t *pSrc)
     /* Transform rows */
     for (i = 0; i < 16; i += 4)
     {
+// For plain c, UNZIGSAG_IN_QUANT is always 0, TRANSPOSE_BLOCK is always 1
 #if TRANSPOSE_BLOCK
         int d0 = pSrc[(i >> 2) + 0];
         int d1 = pSrc[(i >> 2) + 4];
@@ -7202,8 +7203,7 @@ static int h264e_transform_sub_quant_dequant(const pix_t *inp, const pix_t *pred
     return quantize(q, mode, qdat, zmask);
 }
 
-// For chroma intra4x4 side = 1, mask = -1
-// For luma, side = 2, mask = 0xf0 00 00 00
+// For luma intra4x4 side = 1, mask = -1
 static void h264e_transform_add(pix_t *out, int out_stride, const pix_t *pred, quant_t *q, int side, int32_t mask)
 {
     int crow = side;
@@ -9243,7 +9243,7 @@ static void mb_write(h264e_enc_t *enc, int enc_type, int base_mode)
     int i, uv, mb_type, cbpc, cbpl, cbp;
     scratch_t *qv = enc->scratch;
     //int base_mode = enc_type > 0 ? 1 : 0;
-    int mb_type_svc = base_mode ? -2 : enc->mb.type;
+    int mb_type_svc = base_mode ? -2 : enc->mb.type; /* intra4x4 5; intra16x16 6; */
     int intra16x16_flag = mb_type_svc >= 6;// && !base_mode;
     uint8_t nz[9];
     uint8_t *nnz_top = enc->nnz + 8 + enc->mb.x*8;
@@ -9692,8 +9692,11 @@ static void intra_choose_4x4(h264e_enc_t *enc)
             //  skip transform on low SAD gains just about 2% for all-intra coding at QP40,
             //  for other QP gain is minimal, so SAD check do not used
             //  transform quant and dequant
+            //  nz_mask 用来存储16个4x4宏块量化后有非0元素宏块的位置信息
             nz_mask |= h264e_transform_sub_quant_dequant(blockin, block, 16, QDQ_MODE_INTRA_4, qv->qy + n, enc->rc.qdat[0]);
 
+            // nz_mask最低位用来表示当前4x4宏块对残差量化后是否有非0值
+            // 如果有的话则要对当前4x4宏块反量化（在前一步中已经完成）==>反变换==>重建原始数据，结果存在block中(该结构体之前存储宏块预测值)
             if (nz_mask & 1)
             {
                 // Update qy->dq and block, block is the reconstructed block
@@ -9721,7 +9724,7 @@ static void intra_choose_4x4(h264e_enc_t *enc)
     {
         enc->mb.cost = cost;
         enc->mb.type = 5;   // intra 4x4
-        h264e_copy_16x16(mb_dec, enc->dec.stride[0], dec, 16);  // restore reference
+        h264e_copy_16x16(mb_dec, enc->dec.stride[0], dec/* 重建后的数据 */, 16);  // restore reference
     }
 }
 
