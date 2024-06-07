@@ -1356,8 +1356,8 @@ static void h264e_vlc_encode_sse2(bs_t *bs, int16_t *quant, int maxNumCoeff, uin
             int sym_len, prefix_len;
 
             int sym = *levels-- - 2;
-            if (sym < 0) sym = -3 - sym;
-            if (sym >= 6) vlcnum++;
+            if (sym < 0) sym = -3 - sym; // 将非零系数从有符号变为无符号；
+            if (sym >= 6) vlcnum++; // ?
             if (trailing_ones < 3)
             {
                 sym -= 2;
@@ -1396,17 +1396,18 @@ static void h264e_vlc_encode_sse2(bs_t *bs, int16_t *quant, int maxNumCoeff, uin
 
             for (;;)
             {
-                sym_len = vlcnum;
-                prefix_len = sym >> vlcnum;
+                // sym = 4; vlcnum=1;
+                sym_len = vlcnum; // 1
+                prefix_len = sym >> vlcnum; // 2
                 if (prefix_len >= 15)
                 {
 escape:
                     prefix_len = 15;
                     sym_len = 12;
                 }
-                sym -= prefix_len << vlcnum;
+                sym -= prefix_len << vlcnum; // 0
 
-                if (prefix_len >= 3 && vlcnum < 6) vlcnum++;
+                if (prefix_len >= 3 && vlcnum < 6) vlcnum++; // 更新后缀长度
 loop_enter:
                 sym |= 1 << sym_len;
                 sym_len += prefix_len+1;
@@ -7070,6 +7071,7 @@ static int zero_smallq(quant_t *q, int mode, const uint16_t *qdat)
     {
         for (i = 0; i < n*n; i++)
         {
+            // i0=1,跳过DC系数
             if (is_zero(q[i].dq, i0, qdat + OFFS_THR_1_OFF /* 10 */))
             {
                 zmask |= (1 << i); //9.19
@@ -7199,6 +7201,8 @@ static int h264e_transform_sub_quant_dequant(const pix_t *inp, const pix_t *pred
         } while (--cloop);
     }
     // if mode = QDQ_MODE_INTRA_4, return 0 (no zero blocks)
+    // 判断AC系数是否为0
+    // zmask 4 bits； 1: AC全0
     zmask = zero_smallq(q, mode, qdat);
     return quantize(q, mode, qdat, zmask);
 }
@@ -7419,7 +7423,7 @@ static void h264e_vlc_encode(bs_t *bs, int16_t *quant, int maxNumCoeff, uint8_t 
         if (v)
         {
             *--levels = v*2;
-            *prun++ = cloop;
+            *prun++ = cloop; // RunBefore
         }
     } while (--cloop);
     quant += maxNumCoeff;
@@ -7428,7 +7432,7 @@ static void h264e_vlc_encode(bs_t *bs, int16_t *quant, int maxNumCoeff, uint8_t 
 
     if (nnz)
     {
-        cloop = MIN(3, nnz);
+        cloop = MIN(3, nnz); // 拖尾系数数目不超过三个
         levels = quant - 1;
         do
         {
@@ -7440,7 +7444,7 @@ static void h264e_vlc_encode(bs_t *bs, int16_t *quant, int maxNumCoeff, uint8_t 
             trailing_ones++;
         } while (--cloop);
     }
-    nlevels = nnz - trailing_ones;
+    nlevels = nnz - trailing_ones; // 除了拖尾系数之外的非零系数个数
 
     nnz_context = nz_ctx[-1] + nz_ctx[1];
 
@@ -7471,24 +7475,27 @@ static void h264e_vlc_encode(bs_t *bs, int16_t *quant, int maxNumCoeff, uint8_t 
         }
         if (nlevels)
         {
-            int vlcnum = 1;
+            // sym：幅值从有符号变为无符号
+            // vlcnum: 编码后缀长度
+            // prefix_len: 前缀
+            int vlcnum = 1; // 初始化后缀长度为0
             int sym_len, prefix_len;
 
             int sym = *levels-- - 2;
             if (sym < 0) sym = -3 - sym;
-            if (sym >= 6) vlcnum++;
+            if (sym >= 6) vlcnum++; // ?
             if (trailing_ones < 3)
             {
                 sym -= 2;
                 if (nnz > 10)
-                {
+                {   // 此时suffixLength初始化为1
                     sym_len = 1;
                     prefix_len = sym >> 1;
                     if (prefix_len >= 15)
                     {
                         // or vlcnum = 1;  goto escape;
                         prefix_len = 15;
-                        sym_len = 12;
+                        sym_len = 12;  // levelSuffixsSize=level_prefix - 3;
                     }
                     sym -= prefix_len << 1;
                     // bypass vlcnum advance due to sym -= 2; above
@@ -7515,6 +7522,7 @@ static void h264e_vlc_encode(bs_t *bs, int16_t *quant, int maxNumCoeff, uint8_t 
 
             for (;;)
             {
+                // vlc是当前的suffixLength
                 sym_len = vlcnum;
                 prefix_len = sym >> vlcnum;
                 if (prefix_len >= 15)
@@ -7523,12 +7531,14 @@ escape:
                     prefix_len = 15;
                     sym_len = 12;
                 }
-                sym -= prefix_len << vlcnum;
+                sym -= prefix_len << vlcnum; // 恒为0
 
                 if (prefix_len >= 3 && vlcnum < 6)
-                    vlcnum++;
+                    vlcnum++; // 更新后缀长度
 loop_enter:
+                // 此时 sym_len是levelSuffixsSize
                 sym |= 1 << sym_len;
+                // 此时sym_len是整个码流的长度
                 sym_len += prefix_len + 1;
                 BS_PUT(sym_len, sym);
                 if (!--nlevels) break;
@@ -9246,6 +9256,7 @@ static void mb_write(h264e_enc_t *enc, int enc_type, int base_mode)
     int mb_type_svc = base_mode ? -2 : enc->mb.type; /* intra4x4 5; intra16x16 6; */
     int intra16x16_flag = mb_type_svc >= 6;// && !base_mode;
     uint8_t nz[9];
+    /*nmbx*8 + 8*/
     uint8_t *nnz_top = enc->nnz + 8 + enc->mb.x*8;
     uint8_t *nnz_left = enc->nnz;
 
@@ -9328,7 +9339,7 @@ l_skip:
 
             if (nz_mask)
             {
-                cbpc = 2;
+                cbpc = 2; // 所有残差系数都被传送
             }
             // Process the chroma block DC coefficients separately.
             // Store dc quant coefficients in quant_dc_u/quant_dc_v
@@ -9356,9 +9367,10 @@ l_skip:
                 h264e_transform_add(enc->dec.yuv[uv], enc->dec.stride[uv], pred, pquv, 2, nz_mask << 28);
             }
         }
-        cbpc = MIN(cbpc, 2);
+        cbpc = MIN(cbpc, 2); // 只有0, 1, 2有意义
 
         // Rollback to skip
+        // 判断是否跳过宏块编码，优化编码效率。
         if (!(enc->mb.type | cbpl | cbpc) && // Inter prediction, all-zero after quantization
             mv_equal(enc->mb.mv[0], enc->mb.mv_skip_pred)) // MV == MV preditor for skip
         {
@@ -9373,7 +9385,7 @@ l_skip:
             {
                 cbpl = 15;
             }
-            mb_type += enc->mb.i16.pred_mode_luma + cbpc*4 + (cbpl ? 12 : 0);
+            mb_type += enc->mb.i16.pred_mode_luma + cbpc*4 + (cbpl ? 12 : 0); // I_16x16_x_y_z
         }
         if (mb_type >= 5 && enc->slice.type == SLICE_TYPE_I)    // Intra in I slice
         {
@@ -9395,7 +9407,8 @@ l_skip:
         if (!base_mode)
             UE(mb_type);
 
-        if (enc->mb.type == 3) // 8x8
+        // -1 = skip, 0 = P16x16, 1 = P16x8, 2=P8x16, 3 = P8x8, 5 = I4x4, >=6 = I16x16
+        if (enc->mb.type == 3) // P8x8
         {
             for (i = 0; i < 4; i++)
             {
@@ -9416,13 +9429,14 @@ l_skip:
                 {
                     for (i = 0; i < 16; i++)
                     {
+                        // ZigZag scan
                         int m = enc->mb.i4x4_mode[decode_block_scan[i]];
                         int nbits =  4;
                         if (m < 0)
                         {
                             m = nbits = 1;
                         }
-                        U(nbits, m);
+                        U(nbits, m); // intra 4x4 预测模式
                     }
                 }
                 pred_mode_chroma = enc->mb.i16.pred_mode_luma;
@@ -9430,7 +9444,7 @@ l_skip:
                 {
                     pred_mode_chroma ^= 2;
                 }
-                UE(pred_mode_chroma);
+                UE(pred_mode_chroma); // chroma 8x8 预测模式
                 me_mv_medianpredictor_put(enc, 0, 0, 4, 4, point(MV_NA,0));
             } else
             {
