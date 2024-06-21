@@ -6903,6 +6903,7 @@ static void h264e_quant_luma_dc(quant_t *q, int16_t *deq, const uint16_t *qdat)
 
 static int h264e_quant_chroma_dc(quant_t *q, int16_t *deq, const uint16_t *qdat)
 {
+    // q point to scratch->qu or scratch->qv
     int16_t *tmp = ((int16_t*)q) - 16; // dcu/dcv
     hadamar2_2d(tmp);
     // deq: quant_dc_u/quant_dc_v
@@ -7103,7 +7104,7 @@ static int quantize(quant_t *q, int mode, const uint16_t *qdat, int zmask)
     static const unsigned char iscan16[16] = { 0, 1, 5, 6, 2, 4, 7, 12, 3, 8, 11, 13, 9, 10, 14, 15 };
 #endif
 #endif
-    int i, i0 = mode & 1, ccol, crow;
+    int i, i0 = mode & 1, ccol, crow; // mode & 1，避免对chroma宏块的DC进行量化（索引从1开始）
     int nz_block_mask = 0;
     ccol = mode >> 1;
     crow = ccol;
@@ -7133,7 +7134,7 @@ static int quantize(quant_t *q, int mode, const uint16_t *qdat, int zmask)
 
                     if (q->dq[i] < 0) round = 0xFFFF - round;
 
-                    v = (q->dq[i]*qdat[off] + round) >> 16;
+                    v = (q->dq[i]*qdat[off] /* MF */ + round) >> 16;
 #if UNZIGSAG_IN_QUANT
                     if (v)
                         nz_mask |= 1 << iscan16[i];
@@ -9316,7 +9317,7 @@ l_skip:
 
         // Coded Block Pattern for chroma
         cbpc = 0;
-        for (uv = 1; uv < 3; uv++)
+        for (uv = 1; uv < 3; uv++) // Process UV separately
         {
             pix_t *pred = enc->ptest + (uv - 1)*8;
             pix_t *pix_mb_uv = mb_input_chroma(enc, uv);
@@ -9335,6 +9336,7 @@ l_skip:
             }
 
             // nz_mask: x x x x, 4 bits
+            // 根据移位，nz_mask的第三位对应第0个宏块，第0位对应第三个宏块；
             nz_mask = h264e_transform_sub_quant_dequant(pix_mb_uv, pred, inp_stride, QDQ_MODE_CHROMA, pquv, enc->rc.qdat[1]);
 
             if (nz_mask)
@@ -9344,6 +9346,8 @@ l_skip:
             // Process the chroma block DC coefficients separately.
             // Store dc quant coefficients in quant_dc_u/quant_dc_v
             // Store dc dequant coefficients in qu->dq/qv->dq
+            // qv is scratch_t
+            //  quant_t *pquv = (uv == 1) ? qv->qu : qv->qv;
             cbpc |= dc_flag = h264e_quant_chroma_dc(pquv, uv == 1 ? qv->quant_dc_u : qv->quant_dc_v, enc->rc.qdat[1]);
 
             if (!(dc_flag | nz_mask))
@@ -9363,7 +9367,8 @@ l_skip:
                     }
                     nz_mask = 15;
                 }
-                // Reconstructed luma mb in enc->dec.yuv[uv], ac Inverse Transform in qu->dq/qv->dq?
+                // Reconstructed chroma mb in enc->dec.yuv[uv], ac Inverse Transform in qu->dq/qv->dq?
+                // if dc_flag > 0, nz_mask = 15, then nz_mask << 28 = -1;
                 h264e_transform_add(enc->dec.yuv[uv], enc->dec.stride[uv], pred, pquv, 2, nz_mask << 28);
             }
         }
