@@ -865,11 +865,11 @@ const uint8_t h264e_g_total_zeros[150] =
 
 const uint8_t h264e_g_coeff_token[277 + 18] =
 {
-    17 + 18, 17 + 18,
-    82 + 18, 82 + 18,
-    147 + 18, 147 + 18, 147 + 18, 147 + 18,
-    212 + 18, 212 + 18, 212 + 18, 212 + 18, 212 + 18, 212 + 18, 212 + 18, 212 + 18, 212 + 18,
-    0 + 18,
+    17 + 18, 17 + 18, // 0<=NC<2
+    82 + 18, 82 + 18, // 2<=NC<4
+    147 + 18, 147 + 18, 147 + 18, 147 + 18, // 5<=NC<8
+    212 + 18, 212 + 18, 212 + 18, 212 + 18, 212 + 18, 212 + 18, 212 + 18, 212 + 18, 212 + 18, // NC>=8，定长表格
+    0 + 18, // NC==-1
     /**** Table #  4 size 17 ****/     // offs: 0
     CODE(1, 2), CODE(1, 1), CODE(1, 3), CODE(5, 6), CODE(7, 6), CODE(6, 6), CODE(2, 7), CODE(0, 7), CODE(4, 6),
     CODE(3, 7), CODE(2, 8), CODE(0, 0), CODE(3, 6), CODE(3, 8), CODE(0, 0), CODE(0, 0), CODE(2, 6),
@@ -7449,7 +7449,8 @@ static void h264e_vlc_encode(bs_t *bs, int16_t *quant, int maxNumCoeff, uint8_t 
 
     nnz_context = nz_ctx[-1] + nz_ctx[1];
 
-    nz_ctx[0] = (uint8_t)nnz;
+    nz_ctx[0] = (uint8_t)nnz; // 更新当前块非零系数的数目
+    // 获取NC
     if (nnz_context <= 34)
     {
         nnz_context = (nnz_context + 1) >> 1;
@@ -7458,9 +7459,9 @@ static void h264e_vlc_encode(bs_t *bs, int16_t *quant, int maxNumCoeff, uint8_t 
 
     // 9.2.1 Parsing process for total number of transform coefficient levels and trailing ones
     {
-        int off = h264e_g_coeff_token[nnz_context];
+        int off = h264e_g_coeff_token[nnz_context]; // 选择非零系数数目和拖尾系数数目的编码表格
         int n = 6, val = h264e_g_coeff_token[off + trailing_ones + 4*nlevels];
-        if (off != 230)
+        if (off != 230) // 非定长表格
         {
             n = (val & 15) + 1;
             val >>= 4;
@@ -7472,6 +7473,7 @@ static void h264e_vlc_encode(bs_t *bs, int16_t *quant, int maxNumCoeff, uint8_t 
     {
         if (trailing_ones)
         {
+            // 对每个拖尾系数的符号进行编码
             BS_PUT(trailing_ones, trailing_ones_sign);
         }
         if (nlevels)
@@ -7479,17 +7481,20 @@ static void h264e_vlc_encode(bs_t *bs, int16_t *quant, int maxNumCoeff, uint8_t 
             // sym：幅值从有符号变为无符号
             // vlcnum: 编码后缀长度
             // prefix_len: 前缀
-            int vlcnum = 1; // 初始化后缀长度为0
+            int vlcnum = 1; // 初始化后缀长度为1,由于是直接跳入loop_enter，绕过第一次更新
             int sym_len, prefix_len;
 
+            // levels指向是非零系数，已经乘2
+            // 将非零系数从有符号变为无符号
             int sym = *levels-- - 2;
             if (sym < 0) sym = -3 - sym;
-            if (sym >= 6) vlcnum++; // ?
+
+            if (sym >= 6) vlcnum++; // 更新后缀长度为2, 不应该放在这里
             if (trailing_ones < 3)
             {
-                sym -= 2;
+                sym -= 2;  // 为什么会有一个减2的操作
                 if (nnz > 10)
-                {   // 此时suffixLength初始化为1
+                {   // 此时suffixLength初始化为1, 此时编码前缀长度是幅值右移一位，原因suffixLength初始化为1
                     sym_len = 1;
                     prefix_len = sym >> 1;
                     if (prefix_len >= 15)
@@ -7503,17 +7508,17 @@ static void h264e_vlc_encode(bs_t *bs, int16_t *quant, int maxNumCoeff, uint8_t 
                     goto loop_enter;
                 }
             }
-
+            // 编码前缀长度等于幅值，并且编码前缀范围0~15
             if (sym < 14)
             {
                 prefix_len = sym;
                 sym = 0; // to avoid side effect in bitbuf
                 sym_len = 0;
-            } else if (sym < 30)
+            } else if (sym < 15 /* 30 */) // 编码前缀长度等于14 ,修订
             {
                 prefix_len = 14;
                 sym_len = 4;
-                sym -= 14;
+                sym -= 14; // 必须为0
             } else
             {
                 vlcnum = 1;
@@ -7525,23 +7530,23 @@ static void h264e_vlc_encode(bs_t *bs, int16_t *quant, int maxNumCoeff, uint8_t 
             {
                 // vlc是当前的suffixLength
                 sym_len = vlcnum;
-                prefix_len = sym >> vlcnum;
-                if (prefix_len >= 15)
+                prefix_len = sym >> vlcnum; // 编码前缀长度
+                if (prefix_len >= 15) // 编码前缀范围0~15
                 {
 escape:
                     prefix_len = 15;
                     sym_len = 12;
                 }
-                sym -= prefix_len << vlcnum; // 恒为0
+                sym -= prefix_len << vlcnum; // 测试是恒为0，也必须恒为0
 
                 if (prefix_len >= 3 && vlcnum < 6)
                     vlcnum++; // 更新后缀长度
 loop_enter:
                 // 此时 sym_len是levelSuffixsSize
-                sym |= 1 << sym_len;
+                sym |= 1 << sym_len; // 此时是1加上编码后缀0的位数. 1左移后缀长度
                 // 此时sym_len是整个码流的长度
-                sym_len += prefix_len + 1;
-                BS_PUT(sym_len, sym);
+                sym_len += prefix_len + 1; // 后缀长度 + 前缀长度 + 1（1的位置）
+                BS_PUT(sym_len, sym); // 写入码流长度，补上前缀长度0的数目
                 if (!--nlevels) break;
                 sym = *levels-- - 2;
                 if (sym < 0) sym = -3 - sym;
@@ -7552,11 +7557,11 @@ loop_enter:
         {
             const uint8_t *vlc = (maxNumCoeff == 4) ? h264e_g_total_zeros_cr_2x2 : h264e_g_total_zeros;
             uint8_t *run = runs;
-            int run_prev = *run++;
-            int nzeros = run_prev - nnz;
-            int zeros_left = 2*nzeros - 1;
+            int run_prev = *run++; // 最后一个非零系数的索引（从1开始）
+            int nzeros = run_prev - nnz; // 最后一个非零系数前零的数目
+            int zeros_left = 2*nzeros /*- 1*/; // 不应该执行-1，修订;除非是码表有特殊的设计
             int ctx = nnz - 1;
-            run[nnz - 1] = (uint8_t)maxNumCoeff; // terminator
+            run[nnz - 1] = (uint8_t)maxNumCoeff; // terminator,终止条件
             for (;;)
             {
                 int t;
@@ -7564,24 +7569,24 @@ loop_enter:
                 int val = vlc[vlc[ctx] + nzeros];
                 int n = val & 15;
                 val >>= 4;
-                BS_PUT(n, val);
+                BS_PUT(n, val);// 第一次进入编码的是最后一个非0系数前0的数目, 后续编码RunBefore和ZerosLeft,且在反向扫描下最后一个非0系数的RunBefore和ZerosLeft无需编码；
 
-                zeros_left -= nzeros;
+                zeros_left -= nzeros; // 第一次时zeros_left=nzeros
                 if (zeros_left < 0)
                 {
                     break;
                 }
 
-                t = *run++;
-                nzeros = run_prev - t - 1;
+                t = *run++; // 6
+                nzeros = run_prev - t - 1; // RunBefore
                 if (nzeros < 0)
                 {
                     break;
                 }
                 run_prev = t;
                 assert(zeros_left < 14);
-                vlc = h264e_g_run_before;
-                ctx = zeros_left;
+                vlc = h264e_g_run_before; // run_before编码表
+                ctx = zeros_left; // Zerosleft
             }
         }
     }
@@ -9410,7 +9415,7 @@ l_skip:
 #endif
 
         if (!base_mode)
-            UE(mb_type);
+            UE(mb_type); // for intra_4x4 write 0, intra_16x16 write I_16x16_x_y_z
 
         // -1 = skip, 0 = P16x16, 1 = P16x8, 2=P8x16, 3 = P8x8, 5 = I4x4, >=6 = I16x16
         if (enc->mb.type == 3) // P8x8
@@ -9450,7 +9455,7 @@ l_skip:
                     pred_mode_chroma ^= 2;
                 }
                 UE(pred_mode_chroma); // chroma 8x8 预测模式
-                me_mv_medianpredictor_put(enc, 0, 0, 4, 4, point(MV_NA,0));
+                me_mv_medianpredictor_put(enc, 0, 0, 4, 4, point(MV_NA,0)); // skip
             } else
             {
                 int part, x = 0, y = 0;
@@ -9482,7 +9487,8 @@ l_skip:
             cbpl=0;
             cbpc = 0;
         }*/
-        if (mb_type_svc < 6)
+        // 对于非intra_16x16的宏块类型CBP不在mb_type字段需要单独指定
+        if (mb_type_svc < 6) /* intra_4x4 5; intra_16x16 6*/
         {
             // encode cbp 9.1.2 Mapping process for coded block pattern
             static const uint8_t cbp2code[2][48] = {
@@ -9494,6 +9500,7 @@ l_skip:
             UE(cbp2code[mb_type_svc < 5][cbp]);
         }
 
+        // 宏块层量化参数的偏移值
         if (cbp || (mb_type_svc >= 6))
         {
             SE(enc->rc.qp - enc->rc.prev_qp);
@@ -9532,6 +9539,7 @@ l_skip:
                     nz[4 + (j & 3) - (j >> 2)] = 0;
                 }
             }
+            // 更新nnz
             for (i = 0; i < 4; i++)
             {
                 nnz_top[i] = nz[1 + i];
